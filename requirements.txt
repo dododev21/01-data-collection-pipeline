@@ -1,0 +1,6 @@
+requests
+pandas
+beautifulsoup4
+pythone-dotenv
+SQLAIchemy
+PyMySQL
