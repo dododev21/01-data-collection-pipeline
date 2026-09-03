@@ -49,22 +49,16 @@ from pathlib import Path
 import requests
 from sqlalchemy.exc import SQLAlchemyError
 
-from src.data_collection_pipeline import (
-        run_crawling, 
-        run_extract, 
-        run_preprocess,
-        run_load
-)     
+from src.data_collection_pipeline.crawling import run_crawling
+from src.data_collection_pipeline.extract import run_extract
+from src.data_collection_pipeline.load import run_load
+from src.data_collection_pipeline.preprocess import run_preprocess
 
 ## --------------------------------------
 ## 프로젝트 경로 설정
 ## --------------------------------------
 
-## main.py 위치한 폴더를 프로젝트 루트 사용
-PROJECT_DIR = Path(__file__).resolve().parent
-
-
-def main() -> tuple[Path, Path, Path, dict[str, int | str]]:
+def main() -> tuple[Path, list[Path], Path, dict[str, int | str]]:
     """
     웹페이지 수집, HTML 파싱, 데이터 전처리, MySQL에 저장을 순서대로 실행한다.
 
@@ -72,7 +66,7 @@ def main() -> tuple[Path, Path, Path, dict[str, int | str]]:
         다음 파일 경로를 저장한 튜플
 
         1. raw HTML 배치 폴더 경로
-        2. 파싱 csv 파일 경로
+        2. 페이지별 parsed csv 파일 경로 목록
         3. 전처리 csv 파일 경로
         4. MySQL 저장 결과 요약
     """
@@ -82,24 +76,16 @@ def main() -> tuple[Path, Path, Path, dict[str, int | str]]:
     print('=' * 60)
 
     ## 1. Crawling ---------------------------------------------
-    ## 웹페이지에 요청을 보내고 원본 HTML을 저장
-    ## 반환값은 저장된 원본 HTML 파일의 Path 객체
-    raw_html_file = run_crawling()
+    raw_batch_dir = run_crawling()
 
     ## 2. Extract -----------------------------------------------
-    ## 원본 HTML 파일 경로를 전달하여 도서 정보를 파싱
-    ## 파싱 결과를 중간 csv로 저장하고 해당 파일 경로 반환
-    parsed_csv_file = run_extract(raw_html_file)
+    parsed_csv_files = run_extract(raw_batch_dir)
 
     ## 3. Preprocess --------------------------------------------
-    ## 파싱 csv 파일 경로를 전달하여 데이터를 전처리
-    ## 전처리 결과를 최종 csv로 저장하고 해당 파일 경로를 반환
-    processed_csv_file = run_preprocess(parsed_csv_file=parsed_csv_file)
+    interim_batch_dir = parsed_csv_files[0].parent
+    processed_csv_file = run_preprocess(interim_batch_dir)
 
     ## 4. Load -----------------------------------------------------
-    ## 전처리 csv 파일 경로를 전달하여 MySQL에 저장
-    ## 입력 파일명, 데이터베이스명, 입력 행 수, DB 영향 행 수가 포함된
-    ##      요약 정보를 반환
     load_summary = run_load(processed_csv_file)
 
     print()
@@ -107,11 +93,13 @@ def main() -> tuple[Path, Path, Path, dict[str, int | str]]:
     print('정적 웹페이지 데이터 수집 파이프라인 완료')
     print('>' * 60)
     print()
-    print(f'✔️  원본 HTML 파일 : {raw_html_file}')
-    print(f'✔️  파싱 완료된 csv 파일 : {parsed_csv_file}')
-    print(f'✔️  전처리 완료된 csv 파일 : {processed_csv_file}')
+    print(f'✔️  raw HTML 배치 폴더 : {raw_batch_dir}')
+    print(f'✔️  parsed CSV 파일 수 : {len(parsed_csv_files)}')
+    print(f'✔️  interim 배치 폴더 : {interim_batch_dir}')
+    print(f'✔️  processed csv 파일 : {processed_csv_file}')
+    print(f'✔️  MySQL 저장 결과 : {load_summary}')
 
-    return (raw_html_file, parsed_csv_file, processed_csv_file, load_summary)
+    return (raw_batch_dir, parsed_csv_files, processed_csv_file, load_summary)
 
 
 if __name__ == '__main__':

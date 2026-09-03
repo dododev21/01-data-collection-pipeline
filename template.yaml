@@ -1,0 +1,389 @@
+## CloudFormation 템플릿 버전 정의
+AWSTemplateFormatVersion: '2010-09-09'
+
+## SAM 구문을 표준 AWS CloudFormation 리소스로 변환하는 매크로 선언
+Transform: AWS::Serverless-2016-10-31
+
+## 템플릿 전체에 대한 설명
+Description: >
+  Books to Scrape 데이터 수집 파이프라인을 위한
+  AWS SAM 템플릿
+
+
+## ===========================================================
+## Parameters
+## 계정 및 환경마다 달라지는 AWS 리소스 값을 외부에서 전달
+## ===========================================================
+
+Parameters:
+
+  ## Amazon RDS MySQL Endpoint
+  DbHost:
+    Type: String
+    Description: Amazon RDS MySQL Endpoint
+
+  ## MySQL Port
+  DbPort:
+    Type: String
+    Default: '3306'
+    Description: Amazon RDS MySQL Port
+
+  ## MySQL Database 이름
+  DbName:
+    Type: String
+    Default: booksdb
+    Description: Amazon RDS MySQL Database Name
+
+  ## RDS가 자동 생성한 Secrets Manager Secret ARN
+  DbSecretArn:
+    Type: String
+    Description: Amazon RDS Managed Secrets Manager Secret ARN
+
+  ## Load Lambda가 실행될 VPC Subnet
+  LoadSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: VPC Subnet ID for Load Lambda
+
+  ## Load Lambda에 연결할 Security Group
+  LoadSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security Group ID for Load Lambda
+
+
+## ===========================================================
+## Globals
+## 모든 Lambda Function에 기본 적용되는 공통 설정
+## ===========================================================
+
+Globals:
+
+  Function:
+
+    ## Lambda Runtime
+    Runtime: python3.13
+
+    ## CPU 아키텍처
+    Architectures:
+      - x86_64
+
+    ## Lambda 메모리
+    MemorySize: 512
+
+    ## Lambda 최대 실행 시간
+    Timeout: 60
+
+
+## ===========================================================
+## Resources
+## 배포할 Lambda, S3 등의 AWS 리소스 정의
+## ===========================================================
+
+Resources:
+
+
+  ## =========================================================
+  ## Data Pipeline S3 Bucket
+  ## Raw / Interim / Processed 데이터 저장
+  ## =========================================================
+
+  DataBucket:
+    Type: AWS::S3::Bucket
+
+    Properties:
+
+      ## S3 Public Access 차단
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+
+
+  ## =========================================================
+  ## Crawling Lambda
+  ## Books to Scrape 웹페이지 수집 → S3 Raw 저장
+  ## =========================================================
+
+  CrawlingFunction:
+    Type: AWS::Serverless::Function
+
+    Properties:
+
+      ## Lambda 물리적 이름
+      FunctionName: books-pipeline-crawling
+
+      ## Lambda 배포 코드 루트
+      CodeUri: .
+
+      ## Lambda Handler
+      Handler: handlers.crawling_handler.lambda_handler
+
+      ## Lambda 설명
+      Description: >
+        Books to Scrape 페이지를 수집하는 Crawling Lambda
+
+      ## Lambda 환경변수
+      Environment:
+        Variables:
+
+          ## Lambda 임시 파일 저장 경로
+          DATA_DIR: /tmp/data
+
+          ## Data Pipeline S3 Bucket 이름
+          DATA_BUCKET_NAME: !Ref DataBucket
+
+      ## Lambda IAM 권한
+      Policies:
+
+        ## Raw HTML을 S3에 저장하기 위한 쓰기 권한
+        - S3WritePolicy:
+            BucketName: !Ref DataBucket
+
+
+  ## =========================================================
+  ## Extract Lambda
+  ## S3 Raw HTML 다운로드 → 파싱 → S3 Interim CSV 저장
+  ## =========================================================
+
+  ExtractFunction:
+    Type: AWS::Serverless::Function
+
+    Properties:
+
+      ## Lambda 물리적 이름
+      FunctionName: books-pipeline-extract
+
+      ## Lambda 배포 코드 루트
+      CodeUri: .
+
+      ## Lambda Handler
+      Handler: handlers.extract_handler.lambda_handler
+
+      ## Lambda 설명
+      Description: >
+        S3 Raw HTML에서 도서 정보를 추출하는 Extract Lambda
+
+      ## Lambda 환경변수
+      Environment:
+        Variables:
+
+          ## Lambda 임시 파일 저장 경로
+          DATA_DIR: /tmp/data
+
+          ## Data Pipeline S3 Bucket 이름
+          DATA_BUCKET_NAME: !Ref DataBucket
+
+      ## Lambda IAM 권한
+      Policies:
+
+        ## Raw HTML 다운로드를 위한 S3 읽기 권한
+        - S3ReadPolicy:
+            BucketName: !Ref DataBucket
+
+        ## Interim CSV 업로드를 위한 S3 쓰기 권한
+        - S3WritePolicy:
+            BucketName: !Ref DataBucket
+
+
+  ## =========================================================
+  ## Preprocess Lambda
+  ## S3 Interim CSV 다운로드 → 전처리 → S3 Processed 저장
+  ## =========================================================
+
+  PreprocessFunction:
+    Type: AWS::Serverless::Function
+
+    Properties:
+
+      ## Lambda 물리적 이름
+      FunctionName: books-pipeline-preprocess
+
+      ## Lambda 배포 코드 루트
+      CodeUri: .
+
+      ## Lambda Handler
+      Handler: handlers.preprocess_handler.lambda_handler
+
+      ## Lambda 설명
+      Description: >
+        S3 Interim 데이터를 전처리하여
+        Processed 데이터를 생성하는 Lambda
+
+      ## Lambda 환경변수
+      Environment:
+        Variables:
+
+          ## Lambda 임시 파일 저장 경로
+          DATA_DIR: /tmp/data
+
+          ## Data Pipeline S3 Bucket 이름
+          DATA_BUCKET_NAME: !Ref DataBucket
+
+      ## Lambda IAM 권한
+      Policies:
+
+        ## Interim CSV 다운로드를 위한 S3 읽기 권한
+        - S3ReadPolicy:
+            BucketName: !Ref DataBucket
+
+        ## Processed CSV 업로드를 위한 S3 쓰기 권한
+        - S3WritePolicy:
+            BucketName: !Ref DataBucket
+
+
+  ## =========================================================
+  ## Load Lambda
+  ## S3 Processed CSV 다운로드 → Amazon RDS MySQL 적재
+  ## =========================================================
+
+  LoadFunction:
+    Type: AWS::Serverless::Function
+
+    Properties:
+
+      ## Lambda 물리적 이름
+      FunctionName: books-pipeline-load
+
+      ## Lambda 배포 코드 루트
+      CodeUri: .
+
+      ## Lambda Handler
+      Handler: handlers.load_handler.lambda_handler
+
+      ## Lambda 설명
+      Description: >
+        S3 Processed 데이터를 다운로드하여
+        Amazon RDS MySQL에 적재하는 Load Lambda
+
+      ## Lambda 환경변수
+      Environment:
+        Variables:
+
+          ## Lambda 임시 파일 저장 경로
+          DATA_DIR: /tmp/data
+
+          ## Data Pipeline S3 Bucket 이름
+          DATA_BUCKET_NAME: !Ref DataBucket
+
+          ## Amazon RDS MySQL Endpoint
+          DB_HOST: !Ref DbHost
+
+          ## Amazon RDS MySQL Port
+          DB_PORT: !Ref DbPort
+
+          ## MySQL Database 이름
+          DB_NAME: !Ref DbName
+
+          ## RDS가 관리하는 Secrets Manager Secret ARN
+          DB_SECRET_ARN: !Ref DbSecretArn
+
+      ## Load Lambda를 RDS와 동일 VPC에 연결
+      VpcConfig:
+
+        ## Load Lambda가 사용할 Security Group
+        SecurityGroupIds:
+          - !Ref LoadSecurityGroupId
+
+        ## Load Lambda가 사용할 Subnet
+        SubnetIds:
+          - !Ref LoadSubnetId
+
+      ## Load Lambda IAM 권한
+      Policies:
+
+        ## VPC 안에서 Lambda ENI를 생성/관리하기 위한 AWS 관리형 정책
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+
+        ## Processed CSV 다운로드를 위한 S3 읽기 권한
+        - S3ReadPolicy:
+            BucketName: !Ref DataBucket
+
+        ## RDS 관리형 Secret 조회를 위한 Secrets Manager 권한
+        - Statement:
+
+            - Sid: ReadDatabaseSecret
+              Effect: Allow
+
+              Action:
+                - secretsmanager:GetSecretValue
+
+              Resource:
+                - !Ref DbSecretArn
+
+
+## ===========================================================
+## Outputs
+## Stack 배포 후 확인할 주요 리소스 정보
+## ===========================================================
+
+Outputs:
+
+
+  ## =========================================================
+  ## S3
+  ## =========================================================
+
+  ## Data Pipeline S3 Bucket 이름
+  DataBucketName:
+    Description: Data Pipeline S3 Bucket Name
+    Value: !Ref DataBucket
+
+
+  ## =========================================================
+  ## Crawling Lambda
+  ## =========================================================
+
+  ## Crawling Lambda 물리적 함수명
+  CrawlingFunctionName:
+    Description: Crawling Lambda Function Name
+    Value: !Ref CrawlingFunction
+
+  ## Crawling Lambda ARN
+  CrawlingFunctionArn:
+    Description: Crawling Lambda Function ARN
+    Value: !GetAtt CrawlingFunction.Arn
+
+
+  ## =========================================================
+  ## Extract Lambda
+  ## =========================================================
+
+  ## Extract Lambda 물리적 함수명
+  ExtractFunctionName:
+    Description: Extract Lambda Function Name
+    Value: !Ref ExtractFunction
+
+  ## Extract Lambda ARN
+  ExtractFunctionArn:
+    Description: Extract Lambda Function ARN
+    Value: !GetAtt ExtractFunction.Arn
+
+
+  ## =========================================================
+  ## Preprocess Lambda
+  ## =========================================================
+
+  ## Preprocess Lambda 물리적 함수명
+  PreprocessFunctionName:
+    Description: Preprocess Lambda Function Name
+    Value: !Ref PreprocessFunction
+
+  ## Preprocess Lambda ARN
+  PreprocessFunctionArn:
+    Description: Preprocess Lambda Function ARN
+    Value: !GetAtt PreprocessFunction.Arn
+
+
+  ## =========================================================
+  ## Load Lambda
+  ## =========================================================
+
+  ## Load Lambda 물리적 함수명
+  LoadFunctionName:
+    Description: Load Lambda Function Name
+    Value: !Ref LoadFunction
+
+  ## Load Lambda ARN
+  LoadFunctionArn:
+    Description: Load Lambda Function ARN
+    Value: !GetAtt LoadFunction.Arn

@@ -1,6 +1,6 @@
 requests
 pandas
 beautifulsoup4
-pythone-dotenv
-SQLAIchemy
+python-dotenv
+SQLAlchemy
 PyMySQL

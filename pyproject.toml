@@ -1,0 +1,28 @@
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+exclude = [
+    "data",
+    "docs",
+    "notebooks",
+    ".venv",
+    ".aws-sam",
+]
+
+
+[tool.ruff.lint]
+select = [
+    "E4",
+    "E7",
+    "E9",
+    "F",
+    "I",
+    "DTZ",
+    "RUF",
+]

@@ -1,100 +1,217 @@
 """
-저장된 원본 HTML을 파싱하는 모듈
+Books to Scrape의 수집 배치 폴더에 저장된 원본 HTML을 파싱하는 모듈입니다.
 
-이 모듈은 다음 작업을 수행합니다.
+raw와 interim이 같은 배치 이름을 사용하도록 변경합니다.
+원본 HTML 배치 폴더의 이름을 그대로 사용하여 interim 배치 폴더를 만들고,
+페이지별 파싱 CSV는 해당 폴더 안에 저장합니다.
 
-1. crawling 단계에서 저장한 원본 HTML을 읽는다.
-2. BeautifulSoup으로 도서 데이터를 파싱한다.
-3. 파싱 결과를 Pandas DataFrame으로 변환한다.
-4. 필수 컬럼, 결측값, 평점, 중복 URL을 검증한다.
-5. 중간 csv 파일로 저장한다.
-6. 저장 결과를 다시 읽어 행 수를 검증한다.
+입력 구조:
+    data/raw/html/YYYYMMDD_HHMMSS/
+        books_page_001.html
+        books_page_002.html
+        ...
+
+출력 구조:
+    data/interim/YYYYMMDD_HHMMSS/
+        books_page_001_parsed.csv
+        books_page_002_parsed.csv
+        ...
 """
 
-
+import re
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin
-from datetime import datetime
 
 import pandas as pd
 from bs4 import BeautifulSoup
 from bs4.element import Tag
 
+from .config import APP_TIMEZONE, BASE_URL, INTERIM_DIR, RAW_HTML_DIR
 
-TARGET_URL = 'https://books.toscrape.com'
-PROJECT_DIR = Path(__file__).resolve().parents[2]
-RAW_HTML_DIR = PROJECT_DIR / 'data' / 'raw' / 'html'
-
-RAW_HTML_PATTERN = 'books_home_*.html'
+BATCH_DIR_PATTERN_RE = re.compile(r'^\d{8}_\d{6}$')
+RAW_HTML_PATTERN = 'books_page_*.html'
+RAW_FILE_PATTERN_RE = re.compile(r'^books_page_(\d{3})\.html$')
 
 RATING_MAP = {
     'One': 1,
     'Two': 2,
     'Three': 3,
     'Four': 4,
-    'Five': 5
+    'Five': 5,
 }
 
 REQUIRED_COLUMNS = [
-    'title', 
-    'price_text', 
-    'availability_text', 
-    'rating_text', 
+    'title',
+    'price_text',
+    'availability_text',
+    'rating_text',
     'rating',
     'detail_path',
-    'detail_url'
+    'detail_url',
+    'source_page',
+    'source_url',
+    'source_file',
 ]
 
-INTERIM_DIR = PROJECT_DIR / 'data' / 'interim'
 
-
-def find_latest_raw_html(
-    directory: Path = RAW_HTML_DIR,
-    pattern: str = RAW_HTML_PATTERN,
-) -> Path:
+def parse_batch_directory_name(batch_dir: Path) -> datetime:
     """
-    지정한 폴더에서 파일명 패턴과 일치하는 최신 HTML 파일을 반환한다.
+    수집 배치 폴더명에서 수집 시각을 추출한다.
+
+    Args:
+        batch_dir:
+            YYYYMMDD_HHMMSS 형식의 수집 배치 폴더 경로
+
+    Returns:
+        배치 폴더명에서 추출한 원본 HTML 수집 시각
+
+    Raises:
+        ValueError:
+            폴더명이 지정한 형식과 일치하지 않는 경우
+
+    Examples:
+        data/raw/html/20260809_224616
+    """
+
+    if BATCH_DIR_PATTERN_RE.fullmatch(batch_dir.name) is None:
+        raise ValueError(f'수집 배치 폴더명 형식이 올바르지 않습니다. {batch_dir.name}')
+
+    return datetime.strptime(batch_dir.name, '%Y%m%d_%H%M%S').replace(tzinfo=APP_TIMEZONE)
+
+
+def find_latest_batch_directory(directory: Path = RAW_HTML_DIR) -> Path:
+    """
+    data/raw/html 폴더에서 가장 최근 수집 배치 폴더를 반환한다.
 
     Args:
         directory:
-            원본 HTML 파일이 저장된 폴더
-
-        pattern:
-            검색할 파일명 패턴
+            수집 배치 폴더들이 저장된 기본 HTML 폴더
 
     Returns:
-        파일명 기준으로 마지막에 있는 HTML 파일 경로
+        가장 최근 수집 배치 폴더 경로
 
     Raises:
         FileNotFoundError:
-            폴더가 없거나 패턴에 맞는 HTML 파일이 없는 경우    
+            기본 HTML 폴더가 없거나 유효한 수집 배치 폴더가 없는 경우
     """
-    if not directory.exists():
+
+    if not directory.is_dir():
         raise FileNotFoundError(f'원본 HTML 폴더가 없습니다. {directory}')
 
-    html_files = sorted(directory.glob(pattern))
+    batch_directories: list[tuple[datetime, Path]] = []
 
-    if not html_files:
-        raise FileNotFoundError('파싱할 원본 HTML 파일이 없습니다.')
+    for batch_dir in directory.iterdir():
+        if not batch_dir.is_dir():
+            continue
 
-    return html_files[-1]
+        try:
+            collected_at = parse_batch_directory_name(batch_dir)
+        except ValueError:
+            continue
+
+        batch_directories.append((collected_at, batch_dir))
+
+    if not batch_directories:
+        raise FileNotFoundError('파싱할 원본 HTML 수집 배치 폴더가 없습니다.')
+
+    return max(batch_directories, key=lambda item: item[0])[1]
+
+
+def parse_raw_file_name(file_path: Path) -> int:
+    """
+    원본 HTML 파일명에서 페이지 번호를 추출한다.
+
+    Args:
+        file_path:
+            books_page_NNN.html 형식의 원본 HTML 파일 경로
+
+    Returns:
+        원본 HTML의 페이지 번호
+
+    Raises:
+        ValueError:
+            파일명이 지정한 규칙과 일치하지 않는 경우
+
+    Examples:
+        books_page_001.html
+    """
+
+    matched = RAW_FILE_PATTERN_RE.fullmatch(file_path.name)
+
+    if matched is None:
+        raise ValueError(f'원본 HTML 파일명 형식이 올바르지 않습니다. {file_path.name}')
+
+    return int(matched.group(1))
+
+
+def find_raw_html_files(batch_dir: Path) -> list[Path]:
+    """
+    수집 배치 폴더의 HTML 파일을 페이지 순서대로 반환한다.
+
+    페이지 번호가 중복되거나 중간 페이지가 누락된 경우 오류를 발생시킨다.
+
+    Args:
+        batch_dir:
+            페이지별 원본 HTML 파일이 저장된 수집 배치 폴더
+
+    Returns:
+        페이지 번호순으로 정렬된 원본 HTML 파일 경로 목록
+
+    Raises:
+        FileNotFoundError:
+            배치 폴더가 없거나 파싱할 HTML 파일이 없는 경우
+
+        ValueError:
+            페이지 번호가 중복되거나 누락된 경우
+    """
+
+    if not batch_dir.is_dir():
+        raise FileNotFoundError(f'수집 배치 폴더가 없습니다. {batch_dir}')
+
+    file_infos: list[tuple[int, Path]] = []
+
+    for file_path in batch_dir.glob(RAW_HTML_PATTERN):
+        try:
+            source_page = parse_raw_file_name(file_path)
+        except ValueError:
+            continue
+
+        file_infos.append((source_page, file_path))
+
+    if not file_infos:
+        raise FileNotFoundError(f'파싱할 원본 HTML 파일이 없습니다. {batch_dir}')
+
+    file_infos.sort(key=lambda item: item[0])
+    source_pages = [source_page for source_page, _ in file_infos]
+
+    if len(source_pages) != len(set(source_pages)):
+        raise ValueError(f'중복된 페이지 번호가 있습니다. {source_pages}')
+
+    expected_pages = list(range(source_pages[0], source_pages[-1] + 1))
+
+    if source_pages != expected_pages:
+        raise ValueError(f'원본 HTML 배치에 누락된 페이지가 있습니다. {source_pages}')
+
+    return [file_path for _, file_path in file_infos]
 
 
 def load_raw_html(file_path: Path) -> bytes:
     """
-    원본 HTML 파일을 바이트 데이터 읽어 반환한다.
+    원본 HTML 파일을 바이트 데이터로 읽어 반환한다.
 
     Args:
         file_path:
-            읽을 HTML 파일 경로
+            읽을 원본 HTML 파일 경로
 
     Returns:
-        HTML 원본 바이트 데이터
+        원본 HTML 바이트 데이터
 
     Raises:
         FileNotFoundError:
-            지정한 파일이 존재하지 않는 경우    
+            지정한 원본 HTML 파일이 존재하지 않는 경우
     """
+
     if not file_path.is_file():
         raise FileNotFoundError(f'HTML 파일이 없습니다. {file_path}')
 
@@ -104,10 +221,10 @@ def load_raw_html(file_path: Path) -> bytes:
 def get_required_tag(
     parent: Tag,
     selector: str,
-    field_name: str
+    field_name: str,
 ) -> Tag:
     """
-    부모 태그에서 필수하위 태그를 찾아 반환한다.
+    부모 태그에서 필수 하위 태그를 찾아 반환한다.
 
     Args:
         parent:
@@ -116,25 +233,23 @@ def get_required_tag(
         selector:
             찾을 CSS 선택자
 
-        field_name
+        field_name:
             오류 메시지에 표시할 필드명
 
     Returns:
         선택자와 일치하는 첫 번째 HTML 태그
 
     Raises:
-       ValueError:
-           필수 태그를 찾지 못한 경우    
+        ValueError:
+            필수 태그를 찾지 못한 경우
     """
+
     tag = parent.select_one(selector)
 
     if tag is None:
-        raise ValueError(
-            f'{field_name} 태그를 찾지 못했습니다. '
-            f'선택자 : {selector}'
-        )
+        raise ValueError(f'{field_name} 태그를 찾지 못했습니다. 선택자 : {selector}')
 
-    return tag    
+    return tag
 
 
 def parse_rating(rating_tag: Tag) -> tuple[str, int]:
@@ -143,31 +258,36 @@ def parse_rating(rating_tag: Tag) -> tuple[str, int]:
 
     Args:
         rating_tag:
-            start-rating 클래스가 있는 HTML 태그
+            star-rating 클래스가 있는 HTML 태그
 
     Returns:
         평점 단어와 숫자 평점의 튜플
 
     Raises:
         ValueError:
-            One부터 Five까지의 평점 클래스를 찾지 못한 경우    
+            One부터 Five까지의 평점 클래스를 찾지 못한 경우
     """
 
-    rating_classes = rating_tag.get('class', []) ## class 속성이 없다면, [] 리턴
-    rating_text = rating_classes[-1]
+    rating_classes = rating_tag.get('class', [])
+
+    rating_text = next(
+        (
+            class_name
+            for class_name in rating_classes
+            if class_name in RATING_MAP
+        ),
+        None,
+    )
 
     if rating_text is None:
-        raise ValueError(f'유효한 평점 클래스를 찾지 못했습니다. : {rating_classes}')
+        raise ValueError(f'유효한 평점 클래스를 찾지 못했습니다. {rating_classes}')
 
     return (rating_text, RATING_MAP[rating_text])
 
 
-def parse_book_item(
-    product: Tag,
-    base_url: str,
-) -> dict[str, str | int]:
+def parse_book_item(product: Tag, base_url: str) -> dict[str, str | int]:
     """
-    도서 상품 HTML 요소 한 개에서 도서 페이지 정보를 추출한다.
+    도서 상품 HTML 요소 한 건에서 도서 정보를 추출한다.
 
     Args:
         product:
@@ -178,10 +298,10 @@ def parse_book_item(
 
     Returns:
         도서 한 건의 파싱 결과 딕셔너리
-    
+
     Raises:
         ValueError:
-            필수 태그나 필수 속성을 찾지 못한 경우    
+            필수 태그나 필수 속성을 찾지 못한 경우
     """
 
     title_tag = get_required_tag(product, 'h3 a', '도서명')
@@ -200,172 +320,298 @@ def parse_book_item(
 
     rating_text, rating = parse_rating(rating_tag)
 
-    book_info = {
+    return {
         'title': title,
         'price_text': price_tag.get_text(strip=True),
         'availability_text': availability_tag.get_text(strip=True),
         'rating_text': rating_text,
         'rating': rating,
         'detail_path': detail_path,
-        'detail_url': urljoin(base_url, detail_path)
+        'detail_url': urljoin(base_url, detail_path),
     }
-
-    return book_info   
 
 
 def parse_books(
     html_content: bytes,
-    base_url: str = TARGET_URL,
+    source_page: int,
+    source_url: str,
+    source_file: str,
 ) -> pd.DataFrame:
     """
-    원본 HTML에서 한 페이지의 모든 도서를 파싱한다.
+    한 페이지의 원본 HTML에서 모든 도서 정보를 파싱한다.
+
+    각 도서 정보에 원본 페이지 번호, URL, 파일명을 함께 저장한다.
+
+    Args:
+        html_content:
+            파싱할 원본 HTML 바이트 데이터
+
+        source_page:
+            원본 페이지 번호
+
+        source_url:
+            원본 페이지 URL
+
+        source_file:
+            원본 HTML 파일명
+
+    Returns:
+        한 페이지의 도서 정보가 저장된 DataFrame
+
+    Raises:
+        ValueError:
+            도서 상품 요소를 찾지 못한 경우
     """
-    soup = BeautifulSoup(html_content, features="html.parser")
+
+    soup = BeautifulSoup(html_content, 'html.parser')
     products = soup.select('article.product_pod')
 
     if not products:
-        raise ValueError(
-            '도서 요소를 찾지 못했습니다. '
-            '원본 HTML과 CSS 선택자를 확인하세요.'
-        )
+        raise ValueError('도서 요소를 찾지 못했습니다. 원본 HTML과 CSS 선택자를 확인하세요.')
 
-    books = [
-        parse_book_item(product, base_url) 
-        for product in products 
-    ]
+    books: list[dict[str, str | int]] = []
+
+    for product in products:
+        book_info = parse_book_item(product, source_url)
+        book_info['source_page'] = source_page
+        book_info['source_url'] = source_url
+        book_info['source_file'] = source_file
+        books.append(book_info)
 
     return pd.DataFrame(books)
 
 
-def validate_books_dataframe(
-        books_df: pd.DataFrame,
-) -> int:
+def validate_books_dataframe(books_df: pd.DataFrame) -> int:
     """
-    파싱 DataFrame을 검증하고 중복 URL 수 반환한다.
+    파싱 결과 DataFrame의 필수 데이터와 값의 범위를 검증한다.
+
+    Args:
+        books_df:
+            한 페이지의 도서 파싱 결과 DataFrame
+
+    Returns:
+        중복된 상세 URL의 개수
+
+    Raises:
+        ValueError:
+            DataFrame이 비어 있거나 필수 컬럼, 결측값,
+            평점, 페이지 번호에 문제가 있는 경우
     """
 
     if books_df.empty:
         raise ValueError('파싱 결과 DataFrame이 비어 있습니다.')
 
     missing_columns = [
-        column 
+        column
         for column in REQUIRED_COLUMNS
         if column not in books_df.columns
     ]
 
     if missing_columns:
-        raise ValueError(f'필수 컬럼이 누락되었다. {missing_columns}')
+        raise ValueError(f'필수 컬럼이 누락되었습니다. {missing_columns}')
 
+    null_counts = books_df[REQUIRED_COLUMNS].isna().sum()
+    invalid_nulls = null_counts[null_counts > 0]
 
-    null_couts = books_df[REQUIRED_COLUMNS].isna().sum()
+    if not invalid_nulls.empty:
+        raise ValueError(f'필수 데이터에 결측값이 있습니다.\n{invalid_nulls.to_string()}')
 
-    if null_couts.sum() > 0:
-        raise ValueError(f'필수 데이터에 결측값이 있습니다. {null_couts[null_couts > 0]}')
+    invalid_ratings = books_df.loc[~books_df['rating'].between(1, 5)]
 
-    invaild_ratings = books_df[~books_df['rating'].between(1, 5)]
-
-    if not invaild_ratings.empty:
+    if not invalid_ratings.empty:
         raise ValueError('1부터 5 범위를 벗어난 평점이 있습니다.')
-    
 
-    duplicate_count = int(
-        books_df['detail_url']
-        .duplicated(keep=False)
-        .sum()
-    )
+    invalid_pages = books_df.loc[books_df['source_page'] <= 0]
+
+    if not invalid_pages.empty:
+        raise ValueError('유효하지 않은 페이지 번호가 있습니다.')
+
+    duplicate_count = int(books_df['detail_url'].duplicated().sum())
 
     return duplicate_count
 
 
+def create_interim_batch_directory(
+    batch_name: str,
+    directory: Path = INTERIM_DIR,
+) -> Path:
+    """
+    원본 HTML 배치와 같은 이름의 interim 배치 폴더를 생성한다.
+
+    Args:
+        batch_name:
+            YYYYMMDD_HHMMSS 형식의 원본 HTML 배치 이름
+
+        directory:
+            interim 배치 폴더들이 저장되는 기본 경로
+
+    Returns:
+        생성된 interim 배치 폴더 경로
+
+    Raises:
+        ValueError:
+            배치 이름이 지정한 형식과 일치하지 않는 경우
+    """
+
+    if BATCH_DIR_PATTERN_RE.fullmatch(batch_name) is None:
+        raise ValueError(f'수집 배치 이름 형식이 올바르지 않습니다. {batch_name}')
+
+    interim_batch_dir = directory / batch_name
+    interim_batch_dir.mkdir(parents=True, exist_ok=True)
+
+    return interim_batch_dir
+
+
 def save_parsed_csv(
     books_df: pd.DataFrame,
-    directory: Path = INTERIM_DIR,
-    saved_at: datetime | None = None,
-):
+    source_page: int,
+    interim_batch_dir: Path,
+) -> Path:
     """
-    파싱 DataFrame을 중간 csv 파일로 저장한다.
+    한 페이지의 파싱 결과를 interim 배치 폴더 안의 CSV 파일로 저장한다.
+
+    배치 폴더가 수집 시각을 관리하므로
+    CSV 파일명에는 페이지 번호와 처리 단계만 포함한다.
+
+    Args:
+        books_df:
+            한 페이지에서 파싱한 도서 DataFrame
+
+        source_page:
+            원본 페이지 번호
+
+        interim_batch_dir:
+            파싱 CSV 파일을 저장할 interim 배치 폴더
+
+    Returns:
+        저장된 CSV 파일 경로
     """
 
-    directory.mkdir(parents=True, exist_ok=True)
-
-    if saved_at is None:
-        saved_at = datetime.now()
-
-    timestamp = saved_at.strftime('%Y%m%d_%H%M%S')
-
-    parsed_file = directory / f'books_page_001_parsed_{timestamp}.csv'
+    parsed_file = interim_batch_dir / f'books_page_{source_page:03d}_parsed.csv'
     books_df.to_csv(parsed_file, index=False, encoding='utf-8-sig')
 
     return parsed_file
 
 
 def verify_saved_csv(
-        parsed_file: Path,
-        original_df: pd.DataFrame,
+    parsed_file: Path,
+    original_df: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    저장한 csv 파일을 다시 읽고 저장 전후의 행 수를 검증한다.
+    저장한 CSV 파일을 다시 읽고 저장 전후의 행 수를 검증한다.
+
+    Args:
+        parsed_file:
+            저장한 CSV 파일 경로
+
+        original_df:
+            CSV 저장 전 원본 DataFrame
+
+    Returns:
+        다시 읽은 CSV DataFrame
+
+    Raises:
+        ValueError:
+            CSV 저장 전후의 행 수가 다른 경우
     """
 
     saved_books_df = pd.read_csv(parsed_file, dtype=str)
 
     if len(saved_books_df) != len(original_df):
-        raise ValueError('csv 저장 전후의 행 수가 다릅니다.')
+        raise ValueError('CSV 저장 전후의 행 수가 다릅니다.')
 
     return saved_books_df
 
 
-def run_extract(raw_html_file: Path | None = None) -> Path:
+def run_extract(batch_dir: Path | None = None) -> list[Path]:
     """
-    원본 HTML 파싱부터 중간 csv 저장까지 실행한다.
+    수집 배치의 원본 HTML을 파싱하고 같은 배치 이름의 interim 폴더에 저장한다.
 
     Args:
-        raw_html_file:
-            파싱할 원본 HTML 파일 경로
+        batch_dir:
+            파싱할 원본 HTML 수집 배치 폴더
 
-            main.py에서 crawling.py 결과를 전달하면 해당 파일을 사용한다.
-            값을 전달하지 않고 이 모듈을 직접 실행하면
-            data/raw/html 폴더의 최신 파일을 자동으로 찾는다.
-    
+            값을 전달하지 않으면 data/raw/html 폴더에서
+            가장 최근 수집 배치 폴더를 자동으로 찾는다.
+
     Returns:
-        저장된 중간 파일 경로
+        페이지별로 저장된 CSV 파일 경로 목록
+
+    Raises:
+        ValueError:
+            페이지 내 중복 상세 URL이 있는 경우
     """
 
-    ## 저장된 원본 HTML의 최신 파일의 경로 리턴
-    if raw_html_file is None:
-        raw_html_file = find_latest_raw_html()
+    if batch_dir is None:
+        batch_dir = find_latest_batch_directory()
 
-    ## 저장된 원본 HTML 파일 일기
-    html_content = load_raw_html(raw_html_file)
+    collected_at = parse_batch_directory_name(batch_dir)
+    raw_html_files = find_raw_html_files(batch_dir)
 
-    ## 원본 HTML에서 한 페이지의 도서 정보를 파싱하여 DataFrame 생성
-    books_df = parse_books(html_content)
+    ## raw 배치와 같은 이름의 interim 배치 폴더 생성
+    interim_batch_dir = create_interim_batch_directory(batch_dir.name)
 
-    ## DataFrame을 검증하고 중복 상세 URL 수 반환
-    duplicate_count = validate_books_dataframe(books_df)
+    parsed_files: list[Path] = []
+    total_book_count = 0
 
-    ## DataFrame을 중간 csv 파일로 저장
-    parsed_file = save_parsed_csv(books_df)
+    for raw_html_file in raw_html_files:
+        source_page = parse_raw_file_name(raw_html_file)
+        source_url = f'{BASE_URL}page-{source_page}.html'
+        html_content = load_raw_html(raw_html_file)
 
-    ## 저장한 csv를 다시 읽고 저장 전후의 행 수 검증
-    saved_books_df = verify_saved_csv(parsed_file, books_df)
+        books_df = parse_books(
+            html_content=html_content,
+            source_page=source_page,
+            source_url=source_url,
+            source_file=raw_html_file.name,
+        )
+
+        duplicate_count = validate_books_dataframe(books_df)
+
+        if duplicate_count > 0:
+            raise ValueError(
+                f'{source_page}페이지에 중복 상세 URL이 있습니다. '
+                f'중복 수 : {duplicate_count}'
+            )
+
+        parsed_file = save_parsed_csv(
+            books_df=books_df,
+            source_page=source_page,
+            interim_batch_dir=interim_batch_dir,
+        )
+
+        verify_saved_csv(parsed_file, books_df)
+
+        parsed_files.append(parsed_file)
+        total_book_count += len(books_df)
+
+        print(f'{source_page:03d}페이지 파싱 완료 : {len(books_df)}')
+        print(f'저장 파일 : {parsed_file.name}')
 
     print('=' * 60)
-    print('정적 웹페이지 파싱 결과')
+    print('정적 웹페이지 페이지네이션 파싱 완료')
     print('=' * 60)
 
-    print(f'원본 HTML 파일 : {raw_html_file}')
-    print(f'파싱한 도서 수 : {len(books_df)}')
-    print(f'도서명 결측 수 : {books_df.title.isna().sum()}')
-    print(f'상세 URL 중복 수 : {duplicate_count}')
-    print(f'평점 최솟값 : {books_df.rating.min()}')
-    print(f'평점 최댓값 : {books_df.rating.max()}')
+    print(f'원본 HTML 배치 : {batch_dir.name}')
+    print(f'수집 배치 시각 : {collected_at:%Y-%m-%d %H:%M:%S}')
+    print(f'파싱 페이지 수 : {len(parsed_files)}')
+    print(f'전체 파싱 도서 수 : {total_book_count}')
+    print(f'생성된 CSV 수 : {len(parsed_files)}')
+    print(f'interim 저장 폴더 : {interim_batch_dir}')
 
-    return parsed_file
+    return parsed_files
 
 
 if __name__ == '__main__':
     try:
         run_extract()
+
     except (FileNotFoundError, OSError, ValueError) as error:
-        print(f'웹페이지 추출 작업에 실패했습니다. : {error}')
+        print('웹페이지 파싱 작업에 실패했습니다.')
+        print(f'오류 내용 : {error}')
+
+        raise SystemExit(1) from error
+
+
+
+

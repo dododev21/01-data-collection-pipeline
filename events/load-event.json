@@ -1,0 +1,5 @@
+{
+  "batch_id": "20260901_035140",
+  "bucket": "books-pipeline-databucket-x7ir4vszosts",
+  "processed_key": "processed/20260901_035140/books_pages_001_003_processed_20260901_035140.csv"
+}
