@@ -5,9 +5,9 @@
 현재 프로젝트는 [Books to Scrape](https://books.toscrape.com/)를 대상으로 다음 두 실행 구조를 함께 제공합니다.
 
 - **로컬 파이프라인**: Crawling → Extract → Preprocess → Load → MySQL
-- **AWS 파이프라인(현재 구현 범위)**: Crawling Lambda → S3 Raw → Extract Lambda → S3 Interim → Preprocess Lambda → S3 Processed
+- **AWS 파이프라인(현재 구현 범위)**: Crawling Lambda → S3 Raw → Extract Lambda → S3 Interim → Preprocess Lambda → S3 Processed → Load Lambda → Amazon RDS MySQL
 
-또한 `pytest`, `Ruff`, GitHub Actions를 이용하여 코드 품질과 테스트를 자동으로 검증하고, AWS SAM과 CloudFormation을 이용하여 Lambda와 S3 리소스를 배포합니다.
+또한 `pytest`, `Ruff`, GitHub Actions를 이용하여 코드 품질과 테스트를 자동으로 검증하고, AWS SAM과 CloudFormation을 이용하여 Lambda와 S3 리소스를 배포합니다. Load 단계에서는 AWS Secrets Manager의 RDS 관리형 Secret과 VPC 네트워크 구성을 이용해 Private RDS MySQL에 안전하게 적재합니다.
 
 ---
 
@@ -68,7 +68,7 @@ run_load()
 
 ### 2.2 AWS 파이프라인 - 현재 구현 상태
 
-현재 AWS 환경에서는 Crawling, Extract, Preprocess 단계를 Lambda로 분리했습니다.
+현재 AWS 환경에서는 Crawling, Extract, Preprocess, Load 단계를 각각 Lambda로 분리했습니다.
 
 ```text
 Books to Scrape
@@ -101,6 +101,18 @@ Preprocess Lambda
        ↓
 Amazon S3
 processed/{batch_id}/
+       ↓
+Load Lambda
+       ↓
+/tmp/data/processed/
+       ↓
+Processed CSV 검증
+       ↓
+AWS Secrets Manager
+       ↓
+Amazon RDS MySQL
+       ↓
+books 테이블 UPSERT
 ```
 
 현재 구현 완료 범위:
@@ -117,13 +129,17 @@ S3 Interim
 Preprocess Lambda
       ↓
 S3 Processed
+      ↓
+Load Lambda
+      ↓
+Amazon RDS MySQL
       ✅ 완료
 
 다음 단계
       ↓
-Load Lambda
+AWS Step Functions
       ↓
-RDS MySQL
+EventBridge Scheduler
 ```
 
 ---
@@ -140,13 +156,15 @@ data-collection-pipeline/
 ├─ events/
 │  ├─ crawling-event.json
 │  ├─ extract-event.json
-│  └─ preprocess-event.json
+│  ├─ preprocess-event.json
+│  └─ load-event.json
 │
 ├─ handlers/
 │  ├─ __init__.py
 │  ├─ crawling_handler.py
 │  ├─ extract_handler.py
-│  └─ preprocess_handler.py
+│  ├─ preprocess_handler.py
+│  └─ load_handler.py
 │
 ├─ src/
 │  └─ data_collection_pipeline/
@@ -165,6 +183,8 @@ data-collection-pipeline/
 │  ├─ test_extract_handler.py
 │  ├─ test_preprocess.py
 │  ├─ test_preprocess_handler.py
+│  ├─ test_load_handler.py
+│  ├─ test_database.py
 │  └─ test_s3_storage.py
 │
 ├─ data/                  # 로컬 실행 데이터, Git 제외
@@ -312,22 +332,47 @@ data/interim/20260830_163041/
 
 MySQL 연결 설정과 SQLAlchemy Engine 생성을 담당합니다.
 
+로컬에서는 `.env`를 사용하고, AWS Lambda에서는 `DB_SECRET_ARN` 환경변수가 존재하면 AWS Secrets Manager의 RDS 관리형 Secret을 사용합니다.
+
 주요 함수:
 
 ```text
 load_database_config()
+    실행 환경에 따라 DB 연결정보 구성
+
+load_database_config_from_secret()
+    Secrets Manager와 Lambda 환경변수로 RDS 연결정보 구성
+
 create_mysql_engine()
+    SQLAlchemy + PyMySQL Engine 생성
+
 test_mysql_connection()
+    MySQL 연결 및 서버 정보 확인
 ```
 
-DB 연결 정보는 로컬 `.env`에서 읽습니다.
+로컬 환경:
 
 ```text
-DB_HOST
-DB_PORT
-DB_NAME
-DB_USER
-DB_PASSWORD
+.env
+├─ DB_HOST
+├─ DB_PORT
+├─ DB_NAME
+├─ DB_USER
+└─ DB_PASSWORD
+```
+
+AWS Lambda 환경:
+
+```text
+Lambda Environment
+├─ DB_HOST
+├─ DB_PORT
+├─ DB_NAME
+└─ DB_SECRET_ARN
+        ↓
+AWS Secrets Manager
+├─ username
+└─ password
 ```
 
 ---
@@ -342,12 +387,14 @@ Processed CSV를 읽고 검증한 뒤 MySQL `books` 테이블에 UPSERT 방식�
 Processed CSV 입력
 → 파일명 및 배치 검증
 → DB 저장용 자료형 변환
+→ 실행 환경에 맞는 DB 연결정보 구성
 → MySQL 연결
 → books 테이블 생성
 → UPSERT
+→ SELECT COUNT(*)로 실제 저장 건수 확인
 ```
 
-현재 AWS Lambda 버전은 아직 구현하지 않았으며 로컬 파이프라인에서 사용합니다.
+로컬에서는 `.env` 기반 MySQL 연결을 사용하고, AWS Lambda에서는 Secrets Manager 기반 RDS MySQL 연결을 사용합니다. `run_load()`는 로컬과 Lambda에서 동일하게 재사용됩니다.
 
 ---
 
@@ -372,6 +419,9 @@ download_interim_batch()
 
 upload_processed_file()
     Preprocess 결과 CSV → S3 processed 영역 업로드
+
+download_processed_file()
+    S3 processed CSV → Load Lambda /tmp 다운로드
 ```
 
 S3 Object Key 예:
@@ -540,6 +590,45 @@ S3 processed/{batch_id}/ 업로드
 
 `processed_key`는 다음 Load 단계에서 처리할 Processed CSV 객체를 정확하게 지정하기 위한 메타데이터입니다.
 
+### 5.4 `load_handler.py`
+
+Load Lambda의 실행 진입점입니다.
+
+입력 Event 예:
+
+```json
+{
+  "batch_id": "20260901_035140",
+  "bucket": "<data-bucket-name>",
+  "processed_key": "processed/20260901_035140/books_pages_001_003_processed_20260901_035140.csv"
+}
+```
+
+처리 흐름:
+
+```text
+Lambda Event
+      ↓
+batch_id / bucket / processed_key 검증
+      ↓
+S3 Processed CSV 다운로드
+      ↓
+/tmp/data/processed/
+      ↓
+run_load()
+      ↓
+Secrets Manager 자격 증명 조회
+      ↓
+Amazon RDS MySQL 연결
+      ↓
+books 테이블 생성 / UPSERT
+      ↓
+실제 저장 건수 확인
+```
+
+Load 결과에는 `input_count`, `affected_row_count`, `stored_book_count`가 포함됩니다.
+
+
 ---
 
 ## 6. S3 데이터 구조
@@ -609,7 +698,8 @@ Resources
 ├─ DataBucket
 ├─ CrawlingFunction
 ├─ ExtractFunction
-└─ PreprocessFunction
+├─ PreprocessFunction
+└─ LoadFunction
 ```
 
 ### `DataBucket`
@@ -654,9 +744,85 @@ DATA_DIR: /tmp/data
 
 Interim CSV를 읽고 Processed CSV를 저장하기 위해 `S3ReadPolicy`, `S3WritePolicy`를 사용합니다.
 
+### `LoadFunction`
+
+```text
+FunctionName: books-pipeline-load
+Runtime: Python 3.13
+Memory: 512 MB
+Timeout: 60 sec
+DATA_DIR: /tmp/data
+DB_HOST: <RDS Endpoint>
+DB_PORT: 3306
+DB_NAME: booksdb
+DB_SECRET_ARN: <RDS Managed Secret ARN>
+```
+
+Processed CSV를 S3에서 읽고 Amazon RDS MySQL에 적재합니다.
+
+주요 권한 및 설정:
+
+```text
+S3ReadPolicy
+→ Processed CSV 다운로드
+
+secretsmanager:GetSecretValue
+→ RDS 관리형 Secret 조회
+
+AWSLambdaVPCAccessExecutionRole
+→ Load Lambda VPC 연결
+
+VpcConfig
+→ RDS와 동일 VPC의 Subnet / Security Group 사용
+```
+
+계정마다 달라지는 RDS Endpoint, Secret ARN, Subnet ID, Security Group ID는 SAM Parameter로 전달합니다.
+
+
 ---
 
-## 9. SAM 관리 S3와 데이터 S3의 차이
+## 9. Amazon RDS 및 VPC 네트워크 구성
+
+Load Lambda는 Private Amazon RDS MySQL에 접근하기 위해 VPC에 연결합니다.
+
+```text
+                         VPC
+        ┌──────────────────────────────────┐
+        │ Load Lambda                      │
+        │ [books-pipeline-lambda-sg]       │
+        │        │                         │
+        │        ├── TCP 3306 ───────→ RDS│
+        │        │                         │
+        │        ├── S3 Gateway Endpoint ──┼──→ Amazon S3
+        │        │                         │
+        │        └── HTTPS 443             │
+        │                 ↓                │
+        │      Secrets Manager             │
+        │      Interface Endpoint          │
+        └──────────────────────────────────┘
+```
+
+```text
+RDS Public Access
+→ No
+
+RDS Security Group
+→ TCP 3306
+→ Source: books-pipeline-lambda-sg
+
+S3 접근
+→ Gateway VPC Endpoint
+
+Secrets Manager 접근
+→ Interface VPC Endpoint
+→ HTTPS 443
+```
+
+RDS 마스터 자격 증명은 AWS Secrets Manager에서 관리하며 Lambda 코드에 사용자 이름과 비밀번호를 직접 저장하지 않습니다.
+
+---
+
+## 10. SAM 관리 S3와 데이터 S3의 차이
 
 AWS 계정에는 SAM 배포 후 서로 다른 목적의 S3 Bucket이 보일 수 있습니다.
 
@@ -700,7 +866,7 @@ DataBucket/processed/
 
 ---
 
-## 10. 환경 구성
+## 11. 환경 구성
 
 ### 10.1 가상환경 생성
 
@@ -769,7 +935,7 @@ DB_PASSWORD=
 
 ---
 
-## 11. 로컬 파이프라인 실행
+## 12. 로컬 파이프라인 실행
 
 ```bash
 python main.py
@@ -799,7 +965,7 @@ main.py
 
 ---
 
-## 12. 테스트와 코드 품질 검사
+## 13. 테스트와 코드 품질 검사
 
 ### pytest
 
@@ -825,6 +991,12 @@ test_extract_handler.py
 test_preprocess_handler.py
     Preprocess Lambda Handler 단위 테스트
 
+test_load_handler.py
+    Load Lambda Handler 입력 검증 및 실행 흐름 테스트
+
+test_database.py
+    로컬 .env 및 Secrets Manager 기반 DB 설정 테스트
+
 test_s3_storage.py
     S3 Raw / Interim / Processed 입출력 기능 단위 테스트
 ```
@@ -847,7 +1019,7 @@ line-length: 100
 
 ---
 
-## 13. GitHub Actions CI
+## 14. GitHub Actions CI
 
 Workflow 위치:
 
@@ -885,7 +1057,7 @@ CI 성공 / 실패
 
 ---
 
-## 14. AWS SAM 빌드 및 배포
+## 15. AWS SAM 빌드 및 배포
 
 프로젝트 파일 또는 `template.yaml`을 수정한 뒤 다음 순서로 검증합니다.
 
@@ -924,9 +1096,9 @@ ap-northeast-2
 
 ---
 
-## 15. Lambda 원격 호출
+## 16. Lambda 원격 호출
 
-### 15.1 Crawling Lambda
+### 16.1 Crawling Lambda
 
 `events/crawling-event.json`:
 
@@ -951,7 +1123,7 @@ sam remote invoke CrawlingFunction `
 raw/{batch_id}/
 ```
 
-### 15.2 Extract Lambda
+### 16.2 Extract Lambda
 
 `events/extract-event.json`은 **직전 Crawling Lambda의 실제 반환값**을 기준으로 작성합니다.
 
@@ -977,7 +1149,7 @@ sam remote invoke ExtractFunction `
 interim/{batch_id}/
 ```
 
-### 15.3 Preprocess Lambda
+### 16.3 Preprocess Lambda
 
 `events/preprocess-event.json`은 **직전 Extract Lambda의 실제 반환값과 S3 Interim 경로**를 기준으로 작성합니다.
 
@@ -1003,11 +1175,33 @@ sam remote invoke PreprocessFunction `
 processed/{batch_id}/
 ```
 
+### 16.4 Load Lambda
+
+`events/load-event.json`은 **직전 Preprocess Lambda의 실제 반환값**을 기준으로 작성합니다.
+
+```json
+{
+  "batch_id": "<actual-batch-id>",
+  "bucket": "<actual-data-bucket-name>",
+  "processed_key": "processed/<actual-batch-id>/<processed-file-name>.csv"
+}
+```
+
+호출:
+
+```powershell
+sam remote invoke LoadFunction `
+  --stack-name books-pipeline `
+  --event-file events/load-event.json
+```
+
+정상 실행 시 `database_name`, `input_count`, `affected_row_count`, `stored_book_count`를 확인합니다.
+
 `sam remote invoke`는 로컬 코드를 실행하는 명령이 아니라, **로컬 SAM CLI를 이용해 AWS에 배포된 Lambda를 원격 호출하는 명령**입니다.
 
 ---
 
-## 16. Lambda `/var/task`와 `/tmp`
+## 17. Lambda `/var/task`와 `/tmp`
 
 Lambda 실행 환경에서 주요 경로의 역할은 다음과 같습니다.
 
@@ -1041,7 +1235,7 @@ Extract Lambda /tmp
 
 ---
 
-## 17. Git 관리 정책
+## 18. Git 관리 정책
 
 이 프로젝트는 블랙리스트 방식의 `.gitignore`를 사용합니다.
 
@@ -1078,7 +1272,7 @@ samconfig.toml
 
 
 
-## 18. 현재 구현 상태
+## 19. 현재 구현 상태
 
 ### 완료
 
@@ -1104,19 +1298,28 @@ AWS SAM
 → S3 Interim 저장
 → Preprocess Lambda
 → S3 Processed 저장
+→ Load Lambda
+→ Amazon RDS MySQL
+→ Secrets Manager 기반 자격 증명 조회
+→ S3 Gateway VPC Endpoint
+→ Secrets Manager Interface VPC Endpoint
 ```
 
 ### 다음 구현 단계
 
 ```text
-S3 Processed
+AWS Step Functions
+      ↓
+Crawling Lambda
+      ↓
+Extract Lambda
+      ↓
+Preprocess Lambda
       ↓
 Load Lambda
-      ↓
-Amazon RDS MySQL
 ```
 
-그 이후에는 각 Lambda를 Step Functions로 연결하고 EventBridge Scheduler를 이용해 정기 실행 구조로 확장할 예정입니다.
+그 이후에는 EventBridge Scheduler를 연결하여 전체 파이프라인을 정기 실행 구조로 확장할 예정입니다.
 
 ```text
 EventBridge Scheduler
@@ -1142,7 +1345,7 @@ RDS MySQL
 
 ---
 
-## 19. 설계 원칙
+## 20. 설계 원칙
 
 - 원본 데이터는 `raw` 영역에 보관합니다.
 - 한 번의 수집 실행을 하나의 `batch_id`로 관리합니다.
@@ -1152,6 +1355,9 @@ RDS MySQL
 - 각 Lambda Handler는 실행 제어에 집중하고 실제 데이터 처리 로직은 `src/` 모듈을 재사용합니다.
 - 공통 설정은 `config.py`에서 관리합니다.
 - 데이터베이스 연결 책임은 `database.py`에서 관리합니다.
+- 로컬에서는 `.env`, AWS Lambda에서는 Secrets Manager를 사용하여 DB 자격 증명을 분리합니다.
+- Amazon RDS는 Public Access를 사용하지 않고 Load Lambda와 동일 VPC에서 접근합니다.
+- S3는 Gateway VPC Endpoint, Secrets Manager는 Interface VPC Endpoint를 사용합니다.
 - AWS S3 입출력 책임은 `s3_storage.py`에서 관리합니다.
 - 테스트에서는 외부 네트워크 및 AWS 의존성을 가능한 한 Mock으로 분리합니다.
 - 로컬과 CI에서 동일한 Ruff/pytest 명령을 사용합니다.
