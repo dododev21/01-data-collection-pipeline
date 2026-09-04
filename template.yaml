@@ -49,6 +49,37 @@ Parameters:
     Type: AWS::EC2::SecurityGroup::Id
     Description: Security Group ID for Load Lambda
 
+  ## EventBridge Scheduler 활성화 여부
+  ScheduleEnabled:
+    Type: String
+    Default: 'true'
+
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+    Description: Enable or disable EventBridge Scheduler
+
+  ## EventBridge Scheduler 실행 주기
+  ## 기본값: 매일 오전 5시 50분
+  ScheduleExpression:
+    Type: String
+    Default: 'cron(50 5 * * ? *)'
+    Description: EventBridge Scheduler cron expression
+
+
+## ===========================================================
+## Conditions
+## 조건에 따라 AWS 리소스 속성을 동적으로 결정
+## ===========================================================
+
+Conditions:
+
+  ## ScheduleEnabled 값이 true인지 확인
+  IsScheduleEnabled: !Equals
+    - !Ref ScheduleEnabled
+    - 'true'
+
 
 ## ===========================================================
 ## Globals
@@ -75,7 +106,7 @@ Globals:
 
 ## ===========================================================
 ## Resources
-## 배포할 Lambda, S3, Step Functions 등의 AWS 리소스 정의
+## 배포할 Lambda, S3, Step Functions, Scheduler 등의 AWS 리소스 정의
 ## ===========================================================
 
 Resources:
@@ -458,6 +489,109 @@ Resources:
             FunctionName: !Ref LoadFunction
 
 
+  ## =========================================================
+  ## EventBridge Scheduler IAM Role
+  ## Scheduler → Step Functions 실행 권한
+  ## =========================================================
+
+  PipelineSchedulerRole:
+    Type: AWS::IAM::Role
+
+    Properties:
+
+      ## IAM Role 신뢰 정책
+      ## EventBridge Scheduler가 이 Role을 사용할 수 있도록 허용
+      AssumeRolePolicyDocument:
+
+        Version: '2012-10-17'
+
+        Statement:
+
+          - Effect: Allow
+
+            Principal:
+              Service:
+                - scheduler.amazonaws.com
+
+            Action:
+              - sts:AssumeRole
+
+      ## Scheduler가 Step Functions를 실행하기 위한 IAM 정책
+      Policies:
+
+        - PolicyName: StartPipelineStateMachine
+
+          PolicyDocument:
+
+            Version: '2012-10-17'
+
+            Statement:
+
+              ## Step Functions 실행 시작 권한
+              - Effect: Allow
+
+                Action:
+                  - states:StartExecution
+
+                ## 실행할 상태 머신 ARN
+                Resource:
+                  - !Ref PipelineStateMachine
+
+
+  ## =========================================================
+  ## EventBridge Scheduler
+  ## 지정한 시간에 Step Functions 상태 머신 자동 실행
+  ## =========================================================
+
+  PipelineSchedule:
+    Type: AWS::Scheduler::Schedule
+
+    Properties:
+
+      ## Scheduler 이름
+      Name: books-pipeline-schedule
+
+      ## Scheduler 설명
+      Description: >
+        Books 데이터 수집 Step Functions를
+        정해진 시간에 자동 실행하는 Scheduler
+
+      ## Scheduler 활성화 상태
+      ## ScheduleEnabled=true  → ENABLED
+      ## ScheduleEnabled=false → DISABLED
+      State: !If
+        - IsScheduleEnabled
+        - ENABLED
+        - DISABLED
+
+      ## 실행 Cron 표현식
+      ScheduleExpression: !Ref ScheduleExpression
+
+      ## Cron 표현식이 해석될 시간대
+      ScheduleExpressionTimezone: Asia/Seoul
+
+      ## Flexible Time Window 사용하지 않음
+      ## 지정된 스케줄 시간에 실행
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+
+      ## Scheduler가 실행할 대상
+      Target:
+
+        ## 실행 대상 Step Functions ARN
+        Arn: !Ref PipelineStateMachine
+
+        ## Scheduler가 사용할 IAM Role ARN
+        RoleArn: !GetAtt PipelineSchedulerRole.Arn
+
+        ## Step Functions 최초 입력 Event
+        Input: |
+          {
+            "start_page": 1,
+            "end_page": 3
+          }
+
+
 ## ===========================================================
 ## Outputs
 ## Stack 배포 후 확인할 주요 리소스 정보
@@ -549,3 +683,23 @@ Outputs:
   PipelineStateMachineArn:
     Description: Books Pipeline Step Functions State Machine ARN
     Value: !Ref PipelineStateMachine
+
+
+  ## =========================================================
+  ## EventBridge Scheduler
+  ## =========================================================
+
+  ## EventBridge Scheduler 이름
+  PipelineScheduleName:
+    Description: Books Pipeline EventBridge Scheduler Name
+    Value: !Ref PipelineSchedule
+
+  ## EventBridge Scheduler ARN
+  PipelineScheduleArn:
+    Description: Books Pipeline EventBridge Scheduler ARN
+    Value: !GetAtt PipelineSchedule.Arn
+
+  ## Scheduler가 사용하는 IAM Role ARN
+  PipelineSchedulerRoleArn:
+    Description: EventBridge Scheduler IAM Role ARN
+    Value: !GetAtt PipelineSchedulerRole.Arn
