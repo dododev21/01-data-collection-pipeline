@@ -75,7 +75,7 @@ Globals:
 
 ## ===========================================================
 ## Resources
-## 배포할 Lambda, S3 등의 AWS 리소스 정의
+## 배포할 Lambda, S3, Step Functions 등의 AWS 리소스 정의
 ## ===========================================================
 
 Resources:
@@ -311,6 +311,153 @@ Resources:
                 - !Ref DbSecretArn
 
 
+  ## =========================================================
+  ## Step Functions 상태 머신
+  ## Crawling → Extract → Preprocess → Load 순차 실행
+  ## =========================================================
+
+  PipelineStateMachine:
+    Type: AWS::Serverless::StateMachine
+
+    Properties:
+
+      ## Step Functions 상태 머신 이름
+      Name: books-pipeline-state-machine
+
+      ## Amazon States Language 기반 워크플로우 정의
+      Definition:
+
+        ## 상태 머신 시작 단계
+        StartAt: Crawling
+
+        ## 파이프라인 단계 정의
+        States:
+
+
+          ## -----------------------------------------------------
+          ## 1. Crawling Lambda 실행
+          ## -----------------------------------------------------
+
+          Crawling:
+            Type: Task
+
+            ## AWS Lambda 동기 호출
+            Resource: arn:aws:states:::lambda:invoke
+
+            Parameters:
+
+              ## Crawling Lambda ARN
+              FunctionName: !GetAtt CrawlingFunction.Arn
+
+              ## 현재 State 입력 전체를 Lambda Event로 전달
+              Payload.$: $
+
+            ## Lambda 응답 중 실제 Payload만 다음 State로 전달
+            OutputPath: $.Payload
+
+            ## 다음 실행 단계
+            Next: Extract
+
+
+          ## -----------------------------------------------------
+          ## 2. Extract Lambda 실행
+          ## -----------------------------------------------------
+
+          Extract:
+            Type: Task
+
+            ## AWS Lambda 동기 호출
+            Resource: arn:aws:states:::lambda:invoke
+
+            Parameters:
+
+              ## Extract Lambda ARN
+              FunctionName: !GetAtt ExtractFunction.Arn
+
+              ## Crawling 결과 전체를 Lambda Event로 전달
+              Payload.$: $
+
+            ## Lambda 응답 중 실제 Payload만 다음 State로 전달
+            OutputPath: $.Payload
+
+            ## 다음 실행 단계
+            Next: Preprocess
+
+
+          ## -----------------------------------------------------
+          ## 3. Preprocess Lambda 실행
+          ## -----------------------------------------------------
+
+          Preprocess:
+            Type: Task
+
+            ## AWS Lambda 동기 호출
+            Resource: arn:aws:states:::lambda:invoke
+
+            Parameters:
+
+              ## Preprocess Lambda ARN
+              FunctionName: !GetAtt PreprocessFunction.Arn
+
+              ## Extract 결과 전체를 Lambda Event로 전달
+              Payload.$: $
+
+            ## Lambda 응답 중 실제 Payload만 다음 State로 전달
+            OutputPath: $.Payload
+
+            ## 다음 실행 단계
+            Next: Load
+
+
+          ## -----------------------------------------------------
+          ## 4. Load Lambda 실행
+          ## -----------------------------------------------------
+
+          Load:
+            Type: Task
+
+            ## AWS Lambda 동기 호출
+            Resource: arn:aws:states:::lambda:invoke
+
+            Parameters:
+
+              ## Load Lambda ARN
+              FunctionName: !GetAtt LoadFunction.Arn
+
+              ## Preprocess 결과 전체를 Lambda Event로 전달
+              Payload.$: $
+
+            ## Lambda 응답 중 실제 Payload만 최종 결과로 사용
+            OutputPath: $.Payload
+
+            ## 상태 머신 실행 종료
+            End: true
+
+
+      ## =======================================================
+      ## Step Functions IAM 권한
+      ## 각 Lambda Function을 호출할 수 있는 최소 권한 부여
+      ## =======================================================
+
+      Policies:
+
+        ## Crawling Lambda 호출 권한
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CrawlingFunction
+
+        ## Extract Lambda 호출 권한
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ExtractFunction
+
+        ## Preprocess Lambda 호출 권한
+        - LambdaInvokePolicy:
+            FunctionName: !Ref PreprocessFunction
+
+        ## Load Lambda 호출 권한
+        - LambdaInvokePolicy:
+            FunctionName: !Ref LoadFunction
+
+
 ## ===========================================================
 ## Outputs
 ## Stack 배포 후 확인할 주요 리소스 정보
@@ -387,3 +534,18 @@ Outputs:
   LoadFunctionArn:
     Description: Load Lambda Function ARN
     Value: !GetAtt LoadFunction.Arn
+
+
+  ## =========================================================
+  ## Step Functions
+  ## =========================================================
+
+  ## Step Functions 상태 머신 이름
+  PipelineStateMachineName:
+    Description: Books Pipeline Step Functions State Machine Name
+    Value: books-pipeline-state-machine
+
+  ## Step Functions 상태 머신 ARN
+  PipelineStateMachineArn:
+    Description: Books Pipeline Step Functions State Machine ARN
+    Value: !Ref PipelineStateMachine
